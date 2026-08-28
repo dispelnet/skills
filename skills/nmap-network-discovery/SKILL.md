@@ -7,10 +7,41 @@ description: >
   "service version scan", "port scan", "nmap", "network inventory",
   "asset discovery", "find devices on subnet", or any request to enumerate
   hosts, services, or operating systems across one or more IP addresses or
-  CIDR ranges.
+  CIDR ranges. Also use when asked whether a firewall is filtering a port, or
+  what changed between two scans of the same range.
 ---
 
 # Nmap Network Discovery
+
+## Before You Run Anything — Scope Gate
+
+**Do not run any command in this skill until the target range is confirmed.**
+
+1. **The user must name the target range, and you must state it back** before
+   the first command. "My network" is not a range — ask for the CIDR or the
+   host list.
+2. **Never default to the local subnet.** Auto-detecting an interface's subnet
+   and scanning it is not a confirmed scope.
+3. **Never widen a confirmed range.** A /24 does not authorise the /16 around
+   it, and a discovered host outside the range is out of scope, not a lead.
+4. This sends packets to hosts you do not control. If a target turns out to be
+   third-party managed, or the user is unsure who owns it, **stop and ask**.
+
+Full legal statement: [Ethical and Legal Notice](#ethical-and-legal-notice).
+
+### Set these first
+
+Every command below uses these. Fill them in from the scope you just
+confirmed, and substitute nothing by hand afterwards. An unset variable
+makes the command fail loudly — that is the point; a hardcoded address
+fails silently against the wrong network.
+
+```bash
+SUBNET="192.168.1.0/24" # the confirmed range
+TARGET="192.168.1.10"   # a single confirmed host
+```
+
+---
 
 Nmap (Network Mapper) is an open-source tool for network discovery and
 security auditing. It operates at OSI Layer 3 and above, making it
@@ -22,6 +53,16 @@ scripts against targets.
 **Key strength over ARP scanning:** Nmap works across routers and on remote
 networks. It can find hosts that are up even when ICMP is blocked, by
 probing TCP/UDP ports instead.
+
+---
+
+**Supporting references** — load only the one you need:
+
+| File | Load when |
+|---|---|
+| `firewall-mapping-reference.md` | The question is what the filtering does, not what is open; a `-p-` sweep needs to resume; the range is above a /20 |
+| `nse-reference.md` | Before running any `--script`, and to check what phones home |
+| `inventory-workflow-reference.md` | Building a repeatable or scheduled inventory, or diffing two scans |
 
 ---
 
@@ -44,16 +85,35 @@ brew install nmap
 The Nmap suite also includes:
 - **Zenmap** — GUI front-end and results viewer
 - **Ncat** — flexible netcat replacement
-- **Ndiff** — compare two scan results
+- **Ndiff** — compare two scan results (`inventory-workflow-reference.md`)
 - **Nping** — packet generation and response analysis
 
 ---
 
 ## How Nmap Discovers Hosts
 
-By default, Nmap pings targets with ICMP echo requests **and** sends TCP
-SYN/ACK probes to ports 80 and 443. This means it finds hosts that block
-pure ICMP pings. You can override this with specific probe types.
+Nmap's default probe set depends on **privilege** and **where the target is**:
+
+| Context | Default probes sent |
+|---|---|
+| Root, target on local Ethernet segment | **ARP only** — Nmap ignores the IP probes entirely |
+| Root, routed/remote target | ICMP echo, TCP SYN → 443, TCP ACK → 80, ICMP timestamp |
+| Non-root, any target | TCP `connect()` → 80 and 443 (no raw packets available) |
+
+Two consequences worth internalising:
+
+- On a local subnet as root, `-sn` is already an ARP scan. Adding `-PR` is
+  explicit but redundant; forcing IP probes instead needs `--send-ip`.
+- Running without root **silently changes what you scanned**. A non-root sweep
+  that finds nothing is not evidence that nothing is there.
+
+**No single probe type is sufficient.** Bano et al. (*Scanning the Internet
+for Liveness*, ACM SIGCOMM CCR 2018) ran concurrent ICMP, five TCP and two UDP
+scans against the IPv4 space and found ICMP echo reveals only **79%** of
+responsive hosts, with **16% discoverable exclusively via TCP** and ~2% only
+via UDP. They also found the majority of hosts answer *inconsistently* across
+ports — only 24% of hosts with a live TCP stack responded to every TCP probe.
+Layer your probe types, and treat a single negative sweep as inconclusive.
 
 Host discovery probe methods:
 
@@ -68,34 +128,128 @@ Host discovery probe methods:
 
 ---
 
+## Scope Control — Staying Inside Authorisation
+
+Authorisation is almost always scoped to *specific* ranges with carve-outs.
+A CIDR block is a blunt instrument: `10.0.0.0/16` will happily include the
+one `/24` you were told to leave alone. Enforce exclusions in the tool, not
+in your attention.
+
+```bash
+# Exclude specific hosts or ranges inline
+nmap $SUBNET --exclude 10.0.5.0/24,10.0.9.11
+
+# Better: keep exclusions in a file, committed alongside the engagement notes
+nmap $SUBNET --excludefile out-of-scope.txt
+```
+
+`out-of-scope.txt` takes one entry per line — single IPs, hostnames, ranges
+or CIDR blocks:
+
+```
+# Medical devices — never scan, vendor-certified configuration
+10.0.5.0/24
+# Legacy PLC, crashes on SYN scan
+10.0.9.11
+# Third-party managed, not covered by this engagement
+vendor-gw.corp.example.com
+```
+
+**Confirm your target set before sending a single packet.** `-sL` expands the
+targets and applies exclusions without touching any host:
+
+```bash
+# Dry run: exactly which addresses would be scanned?
+nmap -sL -n $SUBNET --excludefile out-of-scope.txt
+
+# Count them, and eyeball the total before committing
+nmap -sL -n $SUBNET --excludefile out-of-scope.txt | grep -c "Nmap scan report"
+```
+
+Do this every time the scope file changes. It is the only cheap way to catch
+a typo'd CIDR that would otherwise widen your scan by a factor of 256.
+
+---
+
+## Rate Limiting — Hard Guarantees
+
+Timing templates are *hints*: `-T4` raises parallelism and lowers timeouts,
+but Nmap's dynamic timing still accelerates as far as the network permits.
+There is no ceiling. When you have been given an actual number — "our IPS
+alerts above 50 connections/sec", "this link is 10 Mbit and shared" — only
+the rate flags enforce it.
+
+```bash
+# Hard ceiling: never exceed 40 packets/sec, regardless of template
+sudo nmap -T4 --max-rate 40 -sS $SUBNET
+
+# Floor: don't let a lossy WAN stall the scan indefinitely
+sudo nmap --min-rate 100 -sS $SUBNET
+
+# Cap concurrent probes against fragile embedded targets
+sudo nmap --max-parallelism 1 --max-rate 10 -sS $SUBNET
+```
+
+| Control | Guarantee |
+|---|---|
+| `-T0`…`-T5` | None — a template, dynamic timing still applies |
+| `--max-rate <n>` | Hard upper bound, packets/sec |
+| `--min-rate <n>` | Hard lower bound, packets/sec |
+| `--max-parallelism <n>` | Hard cap on in-flight probes |
+| `--host-timeout <t>` | Abandon a host after `t`, so one tarpit can't stall a sweep |
+
+Keep `-T4` on the command line even when adding rate flags — the fine-grained
+options override the specific values they name while leaving the template's
+other optimisations in place.
+
+**Fragile targets exist.** ICS/SCADA controllers, medical devices, printers
+and old embedded stacks can be crashed by a routine SYN scan. For anything in
+that class, combine `--max-parallelism 1` with a low `--max-rate`, or don't
+scan it at all — put it in the exclude file and note it in the report.
+
+> For enumerating ICS/OT devices *safely* rather than just avoiding them, use
+> the **ics-ot-discovery** skill — it is passive-first and imposes the hard
+> constraints (`-sT`, `--scan-delay`, never `-sV`) that keep controllers up.
+
+---
+
 ## Basic Recipes
 
 ### Quick host sweep (no port scan)
 ```bash
-nmap -sn 192.168.1.0/24
+nmap -sn $SUBNET
 ```
 Lists all live hosts on the subnet. Faster than a full scan; useful as a
 first pass.
 
 ### List scan (DNS reverse lookup, no traffic sent to hosts)
 ```bash
-nmap -sL 192.168.1.0/24
+nmap -sL $SUBNET        # resolves names, sends nothing to the targets
+nmap -sL -n $SUBNET     # no DNS at all — sends nothing, anywhere
 ```
-Useful for pre-flight recon — resolves hostnames without touching the hosts.
+
+Useful for pre-flight recon and for confirming which addresses a target
+expression expands to.
+
+> **`-sL` is not silent.** It sends no packets to the *hosts*, but it does
+> send a reverse-DNS query for every address to your configured resolver.
+> Against an external engagement that hands your entire target list to a third
+> party, and `--dns-servers 8.8.8.8` hands it to Google specifically. Use `-n`,
+> or point `--dns-servers` at a resolver you control.
 
 ### Default port scan (top 1,000 TCP ports)
 ```bash
-nmap 192.168.1.0/24
+nmap $SUBNET
 ```
 
 ### Scan multiple networks at once
 ```bash
-nmap 192.168.1.0/24 10.0.0.0/24
+nmap $SUBNET 10.0.0.0/24    # append ranges — each must be in the confirmed scope
 ```
 
 ### Scan with ARP ping on local subnet (fast, reliable)
 ```bash
-sudo nmap -sn -PR 192.168.1.0/24
+sudo nmap -sn -PR $SUBNET
 ```
 
 ---
@@ -104,34 +258,53 @@ sudo nmap -sn -PR 192.168.1.0/24
 
 ### TCP SYN scan — fast, doesn't complete handshake (default with root)
 ```bash
-sudo nmap -sS 192.168.1.10
+sudo nmap -sS $TARGET
 ```
 
 ### TCP connect scan — completes the handshake (no root required)
 ```bash
-nmap -sT 192.168.1.10
+nmap -sT $TARGET
 ```
 
-### UDP scan — slower, covers DNS, SNMP, DHCP, etc.
+### UDP scan — covers DNS, SNMP, DHCP, NTP, etc.
+
+UDP has no handshake, so Nmap infers state from ICMP port-unreachable
+replies — and Linux rate-limits those to roughly **one per second**. A full
+`-sU -p-` scan of one host therefore takes upwards of 18 hours. This is a
+kernel limit on the target, not something a faster template can fix.
+
 ```bash
-sudo nmap -sU 192.168.1.10
+# Practical default: the 100 most common UDP ports
+sudo nmap -sU --top-ports 100 $TARGET
+
+# Named services you actually care about — by far the fastest approach
+sudo nmap -sU -p 53,67,123,161,500,1900 $TARGET
+
+# Combine with a TCP SYN scan in a single pass
+sudo nmap -sS -sU -p T:22,80,443,U:53,161 $TARGET
+
+# --reason explains open|filtered results, which dominate UDP output
+sudo nmap -sU --top-ports 50 --reason $TARGET
 ```
+
+`open|filtered` means *no reply at all* — the port may be open and silent, or
+dropped by a firewall. It is not a negative result.
 
 ### Scan specific ports
 ```bash
-nmap -p 22,80,443 192.168.1.10
-nmap -p 1-1024 192.168.1.10        # port range
-nmap -p- 192.168.1.10              # all 65,535 ports
+nmap -p 22,80,443 $TARGET
+nmap -p 1-1024 $TARGET        # port range
+nmap -p- $TARGET              # all 65,535 ports
 ```
 
 ### Show only open ports (suppress closed/filtered noise)
 ```bash
-nmap --open 192.168.1.0/24
+nmap --open $SUBNET
 ```
 
 ### Skip host discovery, scan all targets as if up
 ```bash
-sudo nmap -Pn -sS 192.168.1.10
+sudo nmap -Pn -sS $TARGET
 ```
 Use this when a host is alive but blocks all ping probes.
 
@@ -141,18 +314,49 @@ Use this when a host is alive but blocks all ping probes.
 
 ```bash
 # Detect service versions on open ports
-nmap -sV 192.168.1.10
+nmap -sV $TARGET
 
 # Scan specific ports for version info
-nmap -sV -p 22,80,443 192.168.1.0/24
+nmap -sV -p 22,80,443 $SUBNET
 
 # Show only open ports with version info
-nmap -sV --open 192.168.1.0/24
+nmap -sV --open $SUBNET
+```
+
+```bash
+# Control probe depth: 0 = lightest, 9 = try every probe
+nmap -sV --version-intensity 9 $TARGET
+nmap -sV --version-all $TARGET       # same as intensity 9
+nmap -sV --version-light $TARGET     # intensity 2, much faster
+
+# --allports: also probe 9100, which -sV skips by default
+# (printers can spool a probe as a print job)
+nmap -sV --allports $TARGET
 ```
 
 Version detection probes services and reports the software name and version,
 e.g. `OpenSSH 8.9p1`, `Apache httpd 2.4.29`. Useful for spotting outdated
 or vulnerable software across the network.
+
+**Never infer a service from its port number.** Izhikevich et al. (*LZR:
+Identifying Unexpected Internet Services*, USENIX Security 2021) found only
+**3% of HTTP** and **6% of TLS** services run on ports 80 and 443
+respectively, and that services on non-standard ports are *more* likely to be
+insecure — so port-based inference systematically underestimates risk. Port
+443 running something other than TLS is unremarkable; port 8080 running SSH
+is exactly the kind of finding a port-name-based inventory misses.
+
+Two practical consequences:
+
+```bash
+# Always pair -p- with -sV. A wide port scan without version detection
+# produces a list of numbers, not an inventory.
+sudo nmap -p- -sV --open $TARGET
+
+# Trust the SERVICE column only when a VERSION column backs it up.
+# "http" with no version is Nmap reading nmap-services, i.e. guessing
+# from the port number. "Apache httpd 2.4.62" is an actual probe result.
+```
 
 ---
 
@@ -160,16 +364,33 @@ or vulnerable software across the network.
 
 ```bash
 # Detect operating system (requires root)
-sudo nmap -O 192.168.1.10
+sudo nmap -O $TARGET
 
 # OS detection with version scanning
-sudo nmap -O -sV 192.168.1.10
+sudo nmap -O -sV $TARGET
+```
+
+```bash
+# Print a best guess even when no exact fingerprint matches
+sudo nmap -O --osscan-guess $TARGET
+
+# Only attempt OS detection where conditions are favourable —
+# saves time across a subnet by skipping hopeless targets
+sudo nmap -O --osscan-limit -iL live.txt
+
+# Show the match confidence and the conditions Nmap had to work with
+sudo nmap -O --reason -v $TARGET
 ```
 
 Nmap compares TCP/IP stack responses against a fingerprint database to guess
-the OS and kernel version. Results are most accurate when at least one open
-and one closed port are found. Treat results as an educated guess — confirm
-directly on the host when precision matters.
+the OS and kernel version. Accuracy depends on finding **at least one open and
+one closed port** — `--osscan-limit` makes that condition explicit by skipping
+hosts that do not meet it, and `--osscan-guess` relaxes the match threshold
+when they do.
+
+Treat results as an educated guess. Virtualisation, load balancers and NAT all
+distort the fingerprint, and a middlebox may be what you actually fingerprinted.
+Confirm directly on the host when precision matters.
 
 ---
 
@@ -179,12 +400,28 @@ directly on the host when precision matters.
 traceroute in a single command:
 
 ```bash
-sudo nmap -A 192.168.1.10
-sudo nmap -A 192.168.1.0/24       # entire subnet
+sudo nmap -A $TARGET
 ```
 
-This is the recommended starting point for a thorough first scan of an
-unknown host or network.
+This is a good starting point for a thorough first scan of a **single unknown
+host**.
+
+> **Do not run `-A` across a subnet as a first pass.** It is four scan types
+> at once against every host: version detection, OS fingerprinting, the whole
+> default NSE script category, and traceroute. On a /24 that is hours of
+> runtime, a large volume of script traffic against hosts you have not yet
+> triaged, and NSE scripts firing at services you did not know were there.
+
+Scan in two stages instead — cheap sweep, then depth only where warranted:
+
+```bash
+# Stage 1: cheap. Which hosts are up, which ports are open?
+sudo nmap -sS -T4 --top-ports 100 --open $SUBNET -oA sweep
+
+# Stage 2: depth, only against hosts that actually answered
+awk '/Status: Up/{print $2}' sweep.gnmap > live.txt
+sudo nmap -A -T4 -iL live.txt -oA deep
+```
 
 ---
 
@@ -203,11 +440,14 @@ Nmap has six timing templates (`-T0` through `-T5`):
 
 ```bash
 # Fast LAN scan
-sudo nmap -T4 -A 192.168.1.0/24
+sudo nmap -T4 -A $TARGET
 
 # Slow, stealthy scan for IDS evasion
-nmap -T1 -sS 10.0.0.0/24
+nmap -T1 -sS $SUBNET
 ```
+
+Templates set no upper bound on scan rate. When you need one, see
+"Rate Limiting — Hard Guarantees" above.
 
 ---
 
@@ -215,154 +455,45 @@ nmap -T1 -sS 10.0.0.0/24
 
 ```bash
 # Normal text (default)
-nmap -sV 192.168.1.0/24 -oN scan.txt
+nmap -sV $SUBNET -oN scan.txt
 
 # XML (machine-parseable, importable into tools)
-nmap -sV 192.168.1.0/24 -oX scan.xml
+nmap -sV $SUBNET -oX scan.xml
 
 # Grepable format
-nmap -sn 192.168.1.0/24 -oG scan.gnmap
+nmap -sn $SUBNET -oG scan.gnmap
 
 # All formats at once
-nmap -sV 192.168.1.0/24 -oA scan   # produces scan.nmap, scan.xml, scan.gnmap
+nmap -sV $SUBNET -oA scan   # produces scan.nmap, scan.xml, scan.gnmap
 ```
 
 ### Convert XML to readable HTML report
-```bash
-# Install xsltproc
-sudo apt install xsltproc -y
 
-# Convert scan.xml to HTML
+Nmap's XML embeds an `xml-stylesheet` instruction pointing at the local
+`nmap.xsl`, and `xsltproc` follows it automatically — no stylesheet argument
+needed:
+
+```bash
+sudo apt install xsltproc -y
 xsltproc -o scan.html scan.xml
+```
+
+**Opening the raw `.xml` in a browser no longer works.** Modern browsers
+restrict where a stylesheet may be loaded from, so the file renders as raw
+XML. Convert it with `xsltproc` first, or scan with `--webxml` so the XML
+points at the hosted stylesheet instead of a local path:
+
+```bash
+# Portable XML — renders on any internet-connected machine
+nmap -sV $SUBNET -oX scan.xml --webxml
+
+# Explicit stylesheet, if the embedded path is wrong after moving the file
+xsltproc -o scan.html /usr/share/nmap/nmap.xsl scan.xml
 ```
 
 ### Extract live IPs from grepable output
 ```bash
-nmap -sn 192.168.1.0/24 -oG - | awk '/Up$/{print $2}' > live-hosts.txt
-```
-
----
-
-## Packet Tracing and Debug
-
-```bash
-# Trace packets for a single host
-sudo nmap -vv -n -sn -PE -T4 --packet-trace 192.168.1.1
-
-# -vv         increase verbosity
-# -n          skip DNS resolution (faster)
-# -PE         use ICMP echo
-# --packet-trace  print sent/received packets
-```
-
----
-
-## Nmap Scripting Engine (NSE)
-
-NSE scripts extend Nmap with specialised probes. Scripts live at
-`/usr/share/nmap/scripts/`.
-
-```bash
-# List all available scripts
-ls /usr/share/nmap/scripts/
-
-# Run a script against a target
-nmap --script <script-name> <target>
-
-# Pass arguments to a script
-nmap --script <script-name> --script-args "<arg>=<value>" <target>
-```
-
-### Useful NSE recipes
-
-```bash
-# Gather Windows OS info via SMB
-nmap --script smb-os-discovery 192.168.1.0/24
-
-# Detect WAF on a web server
-nmap -p443 --script http-waf-detect \
-  --script-args="http-waf-detect.aggro,http-waf-detect.detectBodyChanges" \
-  target.example.com
-
-# Check for known CVEs against detected services
-nmap -Pn -sV --script=vulners 192.168.1.10
-
-# Enumerate HTTP methods
-nmap --script http-methods -p80,443 192.168.1.10
-
-# Check for default credentials
-nmap --script http-default-accounts 192.168.1.10
-
-# Banner grabbing on all open ports
-nmap --script banner 192.168.1.10
-```
-
----
-
-## Network Inventory Workflow
-
-### Step 1: Discover live hosts
-```bash
-sudo nmap -sn 192.168.1.0/24 -oG - | awk '/Up$/{print $2}' > live-hosts.txt
-cat live-hosts.txt
-```
-
-### Step 2: Full scan of live hosts
-```bash
-sudo nmap -iL live-hosts.txt -A -T4 -oA full-inventory
-```
-
-### Step 3: Convert to HTML for review
-```bash
-xsltproc -o full-inventory.html full-inventory.xml
-```
-
-### Step 4: Check for outdated services
-```bash
-# Example: find all SSH servers and their versions
-grep "ssh" full-inventory.nmap
-```
-
----
-
-## Periodic Inventory Script (cron-ready)
-
-```bash
-#!/bin/bash
-# /usr/local/bin/nmap-inventory.sh
-# Example cron: 0 2 * * 0 /usr/local/bin/nmap-inventory.sh
-
-SUBNET="192.168.1.0/24"
-DATE=$(date +"%Y%m%d")
-OUTDIR="/var/lib/nmap-inventory"
-mkdir -p "$OUTDIR"
-
-sudo nmap -sV -O "$SUBNET" -oX "$OUTDIR/scan-$DATE.xml" -oG "$OUTDIR/scan-$DATE.gnmap"
-
-# Optional: convert to HTML
-xsltproc -o "$OUTDIR/scan-$DATE.html" "$OUTDIR/scan-$DATE.xml"
-
-# Optional: compare to last scan
-PREV=$(ls "$OUTDIR"/scan-*.xml 2>/dev/null | sort | tail -2 | head -1)
-if [ -n "$PREV" ] && [ "$PREV" != "$OUTDIR/scan-$DATE.xml" ]; then
-    ndiff "$PREV" "$OUTDIR/scan-$DATE.xml" > "$OUTDIR/diff-$DATE.txt"
-    echo "Changes since last scan saved to $OUTDIR/diff-$DATE.txt"
-fi
-```
-
----
-
-## Using ndiff to Spot Changes
-
-`ndiff` compares two Nmap XML scans and highlights new/removed hosts and
-ports — ideal for detecting unauthorized changes.
-
-```bash
-# Compare two scans
-ndiff scan-baseline.xml scan-today.xml
-
-# Output only the differences
-ndiff -v scan-baseline.xml scan-today.xml
+nmap -sn $SUBNET -oG - | awk '/Up$/{print $2}' > live-hosts.txt
 ```
 
 ---
@@ -383,15 +514,26 @@ sudo nmap -iL arp-hosts.txt -A -T4 -oA combined-inventory
 
 ---
 
-## DNS Reconnaissance (using public resolvers)
+## Scanning IPv6
 
-```bash
-# Resolve a domain to find its IP
-dig target.example.com
+Nmap needs `-6`, and a /64 cannot be swept — enumeration has to come from
+multicast, NDP, or an external source first.
 
-# Use Google DNS to list reverse-mapped hostnames on that subnet
-nmap --dns-servers 8.8.4.4,8.8.8.8 -sL 203.0.113.0/24
-```
+**Use the `ipv6-network-discovery` skill for this.** It covers the address
+types, the RFC 7707 techniques, and how to hand a resolved host list back to
+Nmap. Running `nmap -6` against a range without that step returns nothing and
+proves nothing.
+
+---
+
+## DNS Reconnaissance
+
+Nmap can resolve names and run DNS NSE scripts, but it is the wrong tool for
+mapping a domain.
+
+**Use the `dns-recon` skill for this** — records, AXFR, subdomain enumeration,
+DNSSEC walking, and mail-security posture. Feed its host list back here with
+`-iL`.
 
 ---
 
@@ -409,11 +551,31 @@ nmap --dns-servers 8.8.4.4,8.8.8.8 -sL 203.0.113.0/24
 | `-Pn`     | Skip host discovery (scan even if no ping reply)  |
 | `-T4`     | Aggressive timing (good for LANs)                 |
 | `-n`      | No DNS resolution (speeds up scans)               |
+| `-6`      | Scan IPv6 targets                                 |
 | `--open`  | Show only open ports                              |
 | `-oA`     | Output in all formats simultaneously              |
 | `-iL`     | Read targets from file                            |
-| `--script`| Run NSE script(s)                                 |
+| `--excludefile` | Exclude out-of-scope hosts listed in a file |
+| `--max-rate`    | Hard ceiling on packets/sec (templates give none) |
+| `--resume`      | Continue an interrupted scan from its `-oN`/`-oG` output — `firewall-mapping-reference.md` |
+| `-sA`           | ACK scan — maps filtered vs unfiltered, not open ports — `firewall-mapping-reference.md` |
+| `--reason`      | Show *why* Nmap called each port open/closed |
+| `--script`| Run NSE script(s) — read `nse-reference.md` first  |
 | `-v/-vv`  | Increase verbosity                                |
+
+---
+
+## Common Mistakes
+
+| Symptom | Usually means | Do this |
+|---|---|---|
+| Every port `filtered` | A firewall dropped the probes — not that the host runs nothing | `-sA --reason` maps the ruleset; `--reason` prints the evidence for each verdict |
+| Host reported down | The probe set varies by privilege and locality, and ICMP is widely blocked | `-Pn`, or change probe type. A clean sweep with one probe type proves nothing |
+| `SERVICE` filled in, `VERSION` empty | Nmap read `nmap-services` — it guessed from the port number | Trust `SERVICE` only when a `VERSION` backs it |
+| UDP scan is nearly all `open\|filtered` | Normal. For UDP, no reply is ambiguous by design | `--reason`, and narrow to named services rather than port ranges |
+| Scan far slower than expected | Retransmits against a filtered network | `--max-retries 2` and `--host-timeout`; see `firewall-mapping-reference.md` |
+
+**The inference ceiling.** A version string is **a claim made by the host**. Distributions backport security fixes without changing it, so a version match is a candidate for host-side confirmation — never a CVE finding on its own.
 
 ---
 
@@ -422,8 +584,9 @@ nmap --dns-servers 8.8.4.4,8.8.8.8 -sL 203.0.113.0/24
 | Scenario                              | Better Tool                              |
 |---------------------------------------|------------------------------------------|
 | Local subnet only, fastest discovery  | `arp-scan` (Layer 2, firewall-immune)    |
-| Internet-wide or /8+ scanning         | Masscan, ZMap                            |
-| Passive discovery (no traffic sent)   | `netdiscover -p`, span port capture      |
+| Internet-wide or /8+ scanning         | Masscan/ZMap then Nmap — `firewall-mapping-reference.md` |
+| Passive discovery (no traffic sent)   | `netdiscover -p`, `bettercap net.recon`  |
+| IPv6 host discovery                   | `scan6`, `ndisc6` — see ipv6-network-discovery |
 | SNMP topology mapping                 | Netdisco, PRTG, SolarWinds               |
 | Continuous monitoring & alerting      | Zabbix, Nagios, Nessus                   |
 | GUI-based scanning                    | Zenmap (Nmap's official GUI)             |
