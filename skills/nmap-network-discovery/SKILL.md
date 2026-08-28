@@ -68,25 +68,9 @@ probing TCP/UDP ports instead.
 
 ## Install Nmap
 
-```bash
-# RHEL / CentOS / Fedora / Rocky
-sudo dnf install nmap -y
-
-# Debian / Ubuntu
-sudo apt install nmap -y
-
-# Arch Linux
-sudo pacman -S nmap
-
-# macOS (via Homebrew)
-brew install nmap
-```
-
-The Nmap suite also includes:
-- **Zenmap** — GUI front-end and results viewer
-- **Ncat** — flexible netcat replacement
-- **Ndiff** — compare two scan results (`inventory-workflow-reference.md`)
-- **Nping** — packet generation and response analysis
+Install `nmap` with your usual package manager. The suite also ships **Ncat**,
+**Nping**, **Zenmap** (GUI), and **Ndiff** — the last of these diffs two scan
+results and is used in `inventory-workflow-reference.md`.
 
 ---
 
@@ -215,42 +199,22 @@ scan it at all — put it in the exclude file and note it in the report.
 
 ## Basic Recipes
 
-### Quick host sweep (no port scan)
-```bash
-nmap -sn $SUBNET
-```
-Lists all live hosts on the subnet. Faster than a full scan; useful as a
-first pass.
+`nmap -sn $SUBNET` sweeps for live hosts without scanning ports, and
+`sudo nmap -sn -PR $SUBNET` does it via ARP on a local subnet — faster and more
+reliable there. Plain `nmap $SUBNET` scans the top 1,000 TCP ports. Further
+ranges can be appended, each of which must be inside the confirmed scope.
 
-### List scan (DNS reverse lookup, no traffic sent to hosts)
+### List scan (no traffic sent to hosts)
 ```bash
 nmap -sL $SUBNET        # resolves names, sends nothing to the targets
 nmap -sL -n $SUBNET     # no DNS at all — sends nothing, anywhere
 ```
-
-Useful for pre-flight recon and for confirming which addresses a target
-expression expands to.
 
 > **`-sL` is not silent.** It sends no packets to the *hosts*, but it does
 > send a reverse-DNS query for every address to your configured resolver.
 > Against an external engagement that hands your entire target list to a third
 > party, and `--dns-servers 8.8.8.8` hands it to Google specifically. Use `-n`,
 > or point `--dns-servers` at a resolver you control.
-
-### Default port scan (top 1,000 TCP ports)
-```bash
-nmap $SUBNET
-```
-
-### Scan multiple networks at once
-```bash
-nmap $SUBNET 10.0.0.0/24    # append ranges — each must be in the confirmed scope
-```
-
-### Scan with ARP ping on local subnet (fast, reliable)
-```bash
-sudo nmap -sn -PR $SUBNET
-```
 
 ---
 
@@ -537,31 +501,20 @@ DNSSEC walking, and mail-security posture. Feed its host list back here with
 
 ---
 
-## Quick Reference — Most-Used Flags
+## Quick Reference — Flags Worth Looking Up
 
-| Flag      | Purpose                                           |
-|-----------|---------------------------------------------------|
-| `-sn`     | Ping sweep, no port scan                          |
-| `-sS`     | TCP SYN scan (stealth, requires root)             |
-| `-sU`     | UDP scan                                          |
-| `-sV`     | Service/version detection                         |
-| `-O`      | OS detection                                      |
-| `-A`      | OS + version + scripts + traceroute               |
-| `-p`      | Specify ports (`-p 22,80` or `-p-` for all)       |
-| `-Pn`     | Skip host discovery (scan even if no ping reply)  |
-| `-T4`     | Aggressive timing (good for LANs)                 |
-| `-n`      | No DNS resolution (speeds up scans)               |
-| `-6`      | Scan IPv6 targets                                 |
-| `--open`  | Show only open ports                              |
-| `-oA`     | Output in all formats simultaneously              |
-| `-iL`     | Read targets from file                            |
+The everyday flags (`-sn`, `-sS`, `-sU`, `-sV`, `-O`, `-A`, `-p`, `-Pn`, `-T4`,
+`-n`, `-6`, `--open`, `-oA`, `-iL`, `-v`) behave as expected. These are the ones
+that carry a trap or point somewhere else:
+
+| Flag | Purpose |
+|-----------------|---------------------------------------------------|
 | `--excludefile` | Exclude out-of-scope hosts listed in a file |
-| `--max-rate`    | Hard ceiling on packets/sec (templates give none) |
+| `--max-rate`    | Hard ceiling on packets/sec — **templates give none** |
 | `--resume`      | Continue an interrupted scan from its `-oN`/`-oG` output — `firewall-mapping-reference.md` |
 | `-sA`           | ACK scan — maps filtered vs unfiltered, not open ports — `firewall-mapping-reference.md` |
 | `--reason`      | Show *why* Nmap called each port open/closed |
-| `--script`| Run NSE script(s) — read `nse-reference.md` first  |
-| `-v/-vv`  | Increase verbosity                                |
+| `--script`      | Run NSE script(s) — read `nse-reference.md` first  |
 
 ---
 
