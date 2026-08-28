@@ -68,22 +68,8 @@ devices, and printers that silently drop ICMP.
 
 ## Install arp-scan
 
-```bash
-# Debian / Ubuntu
-sudo apt install arp-scan -y
-
-# RHEL / CentOS / Fedora / Rocky
-sudo dnf install arp-scan -y
-
-# Arch Linux
-sudo pacman -S arp-scan
-
-# openSUSE
-sudo zypper install arp-scan
-
-# macOS (via Homebrew)
-brew install arp-scan
-```
+`arp-scan` is packaged for every major distribution and is on Homebrew —
+install it with your usual package manager.
 
 > Kali Linux includes arp-scan by default.
 > Windows users: use WSL2 or a Cygwin port from GitHub.
@@ -92,9 +78,8 @@ brew install arp-scan
 
 ## How It Works
 
-arp-scan sends ARP requests to every IP address in the target range. Each
-live host replies with its MAC address. The tool records IP address, MAC
-address, and NIC vendor (resolved from the OUI database).
+Every live host answers an ARP request with its MAC address, which arp-scan
+resolves against the OUI database:
 
 ```
 IP Address      MAC Address         Vendor
@@ -113,29 +98,17 @@ See "MAC Randomization" below.
 
 ## Basic Recipes
 
-### Scan the local network (auto-detect subnet)
-```bash
-sudo arp-scan --localnet
-```
+`sudo arp-scan --localnet` scans the subnet your interface is already on; pass
+`$SUBNET` instead to scan a specific confirmed range. Beyond that:
 
-### Scan a specific subnet
 ```bash
-sudo arp-scan $SUBNET
-```
+# Pin the scan to one interface — see the Wi-Fi caveat below
+sudo arp-scan -I $IFACE $SUBNET
 
-### Scan on a specific interface
-```bash
-sudo arp-scan -I $IFACE --localnet
-sudo arp-scan -I $IFACE $SUBNET   # see the Wi-Fi caveat below
-```
-
-### Quiet mode — IP and MAC only, no vendor info
-```bash
+# Quiet mode — IP and MAC only, no vendor lookup
 sudo arp-scan -q --localnet
-```
 
-### Plain/parseable output (no header/footer)
-```bash
+# Plain/parseable output — no header or footer to strip
 sudo arp-scan -x $SUBNET
 ```
 
@@ -210,16 +183,12 @@ To revert: `sudo setcap -r "$(command -v arp-scan)"`.
 
 ## Output Interpretation
 
-| Column    | Meaning                                                         |
-|-----------|-----------------------------------------------------------------|
-| IP        | IPv4 address of the discovered host                             |
-| MAC       | Ethernet hardware address                                       |
-| Vendor    | NIC manufacturer from OUI database — helps identify device type |
+The vendor column is what makes an ARP sweep an inventory rather than a list
+of addresses:
 
-Vendor examples that aid device classification:
 - `Raspberry Pi Foundation` → IoT / embedded device
 - `Apple, Inc.` → MacBook, iPhone, iPad
-- `Cisco Systems` → Router, switch, access point
+- `Cisco Systems` → router, switch, access point
 - `(Unknown)` → **usually a randomized MAC, not an intruder** — check the
   locally administered bit before investigating (see below)
 
